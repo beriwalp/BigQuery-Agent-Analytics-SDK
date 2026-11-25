@@ -45,11 +45,17 @@ output of:
 
 ```bash
 bq query --use_legacy_sql=false --format=json --max_rows=5000 \
-  'SELECT * EXCEPT(content_parts)
+  'SELECT *
    FROM `your-project.your_dataset.agent_events`
    WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
    ORDER BY timestamp DESC'
 ```
+
+If your table has a `content_parts` column, `SELECT * EXCEPT(content_parts)`
+skips those payloads; `EXCEPT` fails when the column doesn't exist. KPI deltas
+compare against the previous window only when the import reaches back to its
+first day, so a `--max_rows` cap that cuts the export short shows `--` rather
+than a misleading change.
 
 The importer reads `latency_ms`, `attributes.usage_metadata`, and
 `content.tool` whether they arrive as JSON objects or JSON strings. Token
@@ -63,7 +69,9 @@ The data stays in the browser tab.
 **Export CSV** writes the rows shown in the table view, after slicers,
 cross-filters, and the search box. Text cells that a spreadsheet would run as
 a formula (starting with `=`, `+`, `-`, `@`, a tab, or a CR, even after
-leading apostrophes) get one more leading `'`. The export ends with a
+leading apostrophes) get one more leading `'`, and a formula character right
+after a `;` or a tab inside a cell gets a `'` before it too, for spreadsheets
+that split cells on those. The export ends with a
 `copilot_formula_guard` column, and the importer removes that one apostrophe
 only from files that have it, so other CSVs keep their text as written.
 
@@ -76,7 +84,7 @@ metric definitions** view lists them all. The main ones:
 | :-- | :-- |
 | LLM calls | `LLM_RESPONSE` events |
 | Tool calls | `TOOL_COMPLETED` and `TOOL_ERROR` events |
-| Error rate | `LLM_ERROR` and `TOOL_ERROR` events as a share of all LLM and tool calls |
+| Error rate | Failed calls (`LLM_ERROR`, `TOOL_ERROR`, or `LLM_RESPONSE` / `TOOL_COMPLETED` with an `ERROR` status) as a share of all LLM and tool calls |
 | LLM latency, time to first token | `latency_ms.total_ms` and `latency_ms.time_to_first_token_ms` on `LLM_RESPONSE` |
 | Tool latency | `latency_ms.total_ms` on `TOOL_COMPLETED` |
 | Cache hit rate | `cached_content_token_count` as a share of `prompt_token_count` |
@@ -88,7 +96,10 @@ before it. When the earlier window has no data, the change shows `--`.
 
 The SQL dialog renders one multi-statement query: a `CREATE TEMP TABLE` that
 extracts the JSON columns once, then one `SELECT` for the KPI cards and one per
-visual. The table ID must match `project.dataset.table` using the same
+visual. The temp table is built with `EXECUTE IMMEDIATE` after checking
+`INFORMATION_SCHEMA.COLUMNS`, so a table without `attributes`, `content`, or
+`latency_ms` still runs (those fields come back empty). Days are UTC, as on the
+page, whatever the project's default time zone. The table ID must match `project.dataset.table` using the same
 identifier rules as the PBIP parameters. Filter values are written as escaped
 string literals.
 

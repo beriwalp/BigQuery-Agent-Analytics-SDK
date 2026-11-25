@@ -232,6 +232,10 @@
   // the same rule as isErrorRow() on the page.
   const FAILED_TOOL_SQL = '(event_type = \'TOOL_ERROR\' OR ' +
       '(event_type = \'TOOL_COMPLETED\' AND status = \'ERROR\'))';
+  // Cross-filter key for "failed calls only": rows matching isErrorRow() on
+  // the page and FAILED_CALL_SQL in the SQL. Failed *_ERROR events can have
+  // no status, so a status filter would drop them.
+  const FAILED_FILTER = 'failed_calls';
   const FAILED_CALL_SQL =
       '(event_type IN (\'LLM_ERROR\', \'TOOL_ERROR\') OR ' +
       '(event_type IN (\'LLM_RESPONSE\', \'TOOL_COMPLETED\') AND ' +
@@ -468,6 +472,13 @@
     const endMs = Date.parse(newest + 'T00:00:00Z') -
         (opts.previousWindow ? days * DAY_MS : 0);
     const startMs = endMs - (days - 1) * DAY_MS;
+    if (opts.previousWindow) {
+      let oldest = '';
+      for (const r of state.rows) {
+        if (r.event_date && (!oldest || r.event_date < oldest)) oldest = r.event_date;
+      }
+      if (!oldest || Date.parse(oldest + 'T00:00:00Z') > startMs) return [];
+    }
     return state.rows.filter((r) => {
       const dayMs = Date.parse(r.event_date + 'T00:00:00Z');
       if (Number.isNaN(dayMs) || dayMs < startMs || dayMs > endMs) return false;
@@ -479,6 +490,10 @@
       }
       for (const [field, value] of Object.entries(state.crossFilters)) {
         if (field === opts.ignoreField) continue;
+        if (field === FAILED_FILTER) {
+          if (!isErrorRow(r)) return false;
+          continue;
+        }
         if (String(r[field] ?? '') !== String(value)) return false;
       }
       return true;
@@ -594,6 +609,10 @@
     };
   }
 
+  function compareText(a, b) {
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
   // With `keepSecondary`, a group stays when only the secondary metric has a
   // value, so a line chart can show that series with a gap in the other.
   function aggregateBy(rows, dim, metric, secondaryMetric, keepSecondary) {
@@ -614,9 +633,11 @@
       series.push({label, value: isNum(value) ? value : null, secondary});
     }
     if (dim === 'event_date') {
-      series.sort((a, b) => a.label.localeCompare(b.label));
+      series.sort((a, b) => compareText(a.label, b.label));
     } else {
-      series.sort((a, b) => b.value - a.value || a.label.localeCompare(b.label));
+      // Ties break by label in code-unit order, like ORDER BY in BigQuery.
+      series.sort((a, b) => (b.value ?? -Infinity) - (a.value ?? -Infinity) ||
+          compareText(a.label, b.label));
     }
     return series;
   }
@@ -678,9 +699,27 @@
   // field that contains a comma, quote, CR, or LF. Text that a spreadsheet
   // would run as a formula gets a leading apostrophe first, because quoting
   // alone doesn't stop Excel or Sheets from evaluating it.
+  // Guards a text cell: a leading apostrophe when the cell would run as a
+  // formula, and one after any ";" or tab (past the first character) that is
+  // followed by a formula character, since a spreadsheet splitting on those
+  // would start a new cell there.
+  function guardText(text) {
+    const inner = text.replace(/(?<=[\s\S])([;\t])('*\s*[=+\-@])/g, '$1\'$2');
+    return needsFormulaGuard(text) ? `'${inner}` : inner;
+  }
+
+  // Reverses guardText(). Tries the possible originals and keeps the one that
+  // guards back to the exact cell, so the result is always consistent.
+  function unguardText(cell) {
+    const unInner = (t) => t.replace(/([;\t])'('*\s*[=+\-@])/g, '$1$2');
+    const candidates = [unInner(cell)];
+    if (cell.startsWith('\'')) candidates.unshift(unInner(cell.slice(1)));
+    return candidates.find((c) => guardText(c) === cell) ?? cell;
+  }
+
   function csvCell(v) {
     let s = String(v ?? '');
-    if (typeof v === 'string' && needsFormulaGuard(s)) s = `'${s}`;
+    if (typeof v === 'string') s = guardText(s);
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   }
 
@@ -757,20 +796,42 @@
          new RegExp(`\\b${escapeRegex(spaced.toLowerCase())}\\b`).test(text));
   }
 
+  // Words that name a dimension. A member with one of these names (an agent
+  // called "agent") only filters when the prompt quotes it or names it
+  // explicitly ("agent = agent"), so "by agent" still groups.
+  const DIMENSION_WORDS = new Set([
+    'agent', 'agents', 'model', 'models', 'tool', 'tools', 'user', 'users',
+    'status', 'event', 'events', 'type', 'date', 'day', 'days',
+  ]);
+
+  function mentionsMember(ql, field, value) {
+    const v = value.toLowerCase();
+    if (DIMENSION_WORDS.has(v)) {
+      const q = escapeRegex(v);
+      return new RegExp(`["'\`]${q}["'\`]|\\b${field}\\s*[:=]\\s*${q}\\b`)
+          .test(ql);
+    }
+    return mentions(ql, value);
+  }
+
   function detectFilters(ql) {
     const filters = {};
     let days = null;
+    // Grouping clauses ("by agent", "per model") name a dimension, not a
+    // member, so they don't count as filters.
+    const memberText = ql.replace(
+        /\b(by|per|across|for each)\s+(event\s+types?|[a-z_]+)/g, ' ');
     if (/\b(7d|7 days|last week|past week)\b/.test(ql)) days = 7;
     else if (/\b(14d|14 days|2 weeks|two weeks)\b/.test(ql)) days = 14;
     else if (/\b(30d|30 days|last month|past month)\b/.test(ql)) days = 30;
     for (const agent of distinctValues('agent')) {
-      if (mentions(ql, agent)) filters.agent = agent;
+      if (mentionsMember(memberText, 'agent', agent)) filters.agent = agent;
     }
     for (const model of distinctValues('model')) {
-      if (mentions(ql, model)) filters.model = model;
+      if (mentionsMember(memberText, 'model', model)) filters.model = model;
     }
     for (const tool of distinctValues('tool')) {
-      if (mentions(ql, tool)) filters.tool = tool;
+      if (mentionsMember(memberText, 'tool', tool)) filters.tool = tool;
     }
     const user = ql.match(/\buser[-_ ]?(\d{1,6})\b/);
     if (user) {
@@ -780,7 +841,7 @@
       if (wanted) filters.user_id = wanted;
     }
     if (/\b(only errors|errors only|failed calls only|status error)\b/.test(ql)) {
-      filters.status = 'ERROR';
+      filters[FAILED_FILTER] = 'yes';
     }
     return {days, filters};
   }
@@ -988,7 +1049,8 @@
     for (const [field, value] of Object.entries(state.crossFilters)) {
       // A visual ignores its own cross-filter, as on the page.
       if (field === ignoreField) continue;
-      if (DIMENSIONS[field]) clauses.push(`${field} = ${sqlString(value)}`);
+      if (field === FAILED_FILTER) clauses.push(FAILED_CALL_SQL);
+      else if (DIMENSIONS[field]) clauses.push(`${field} = ${sqlString(value)}`);
     }
     return clauses;
   }
@@ -1004,6 +1066,16 @@
   const VISUAL_LIMITS = {
     bar: 8, hbar: 7, donut: DONUT_SLICES, table: ROW_LIST_LIMIT,
   };
+  // A line over a category (not days) shows its top members, like a bar.
+  const LINE_CATEGORY_LIMIT = 10;
+
+  // Members a visual shows, or null for all of them.
+  function visualLimit(v) {
+    if (v.type === 'line') {
+      return v.dim === 'event_date' ? null : LINE_CATEGORY_LIMIT;
+    }
+    return VISUAL_LIMITS[v.type] || null;
+  }
 
   // The slowest-calls and recent-errors tables list rows instead of
   // aggregating a metric by a dimension.
@@ -1020,25 +1092,34 @@
     const lines = [
       `-- BQAA Copilot preview: ${sqlComment(page.title)}`,
       `-- Prompt: ${sqlComment(page.prompt)}`,
-      '-- Run as one multi-statement query. As on the page, the window ends on',
+      '-- Run as one multi-statement query. Days are UTC, as on the page. The',
+      '-- window ends on',
       `-- the newest day with data and covers ${days} days; KPIs also return the`,
       '-- window before it for the deltas.',
       '',
       '-- Look for the newest day in recent partitions first, and fall back',
       '-- to the whole table when it has no recent data.',
       'DECLARE window_end DATE DEFAULT (',
-      `  SELECT MAX(DATE(timestamp)) FROM \`${table}\``,
+      `  SELECT MAX(DATE(timestamp, 'UTC')) FROM \`${table}\``,
       `  WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${
           2 * days} DAY));`,
       'IF window_end IS NULL THEN',
       '  SET window_end = (',
-      `    SELECT MAX(DATE(timestamp)) FROM \`${table}\``,
+      `    SELECT MAX(DATE(timestamp, 'UTC')) FROM \`${table}\``,
       '    WHERE timestamp >= TIMESTAMP \'0001-01-01\');',
       'END IF;',
       '',
+      '-- Payload columns can be missing from the table, so the temp table is',
+      '-- built with EXECUTE IMMEDIATE and reads only the ones that exist.',
+      'DECLARE present ARRAY<STRING> DEFAULT (',
+      `  SELECT ARRAY_AGG(column_name) FROM \`${tableParts[0]}.${
+          tableParts[1]}\`.INFORMATION_SCHEMA.COLUMNS`,
+      `  WHERE table_name = ${sqlString(tableParts[2])});`,
+      '',
+      'EXECUTE IMMEDIATE REPLACE(REPLACE(REPLACE("""',
       'CREATE TEMP TABLE events AS',
       'SELECT',
-      '  DATE(timestamp) AS event_date,',
+      '  DATE(timestamp, \'UTC\') AS event_date,',
       '  timestamp,',
       '  event_type,',
       '  agent,',
@@ -1046,37 +1127,54 @@
       '  session_id,',
       '  trace_id,',
       '  span_id,',
-      '  UPPER(status) AS status,',
+      '  -- A missing status counts as OK, as on the page.',
+      '  COALESCE(NULLIF(UPPER(status), \'\'), \'OK\') AS status,',
       '  error_message,',
-      '  COALESCE(NULLIF(JSON_VALUE(attributes, \'$.model\'), \'\'),',
-      '           JSON_VALUE(attributes, \'$.model_version\')) AS model,',
-      '  COALESCE(JSON_VALUE(content, \'$.tool\'),',
-      '           JSON_VALUE(content, \'$.tool_name\')) AS tool,',
-      '  SAFE_CAST(JSON_VALUE(latency_ms, \'$.total_ms\') AS FLOAT64) AS total_ms,',
-      '  SAFE_CAST(JSON_VALUE(latency_ms, \'$.time_to_first_token_ms\') AS FLOAT64)',
-      '    AS ttft_ms,',
+      '  COALESCE(NULLIF(JSON_VALUE(@@ATTRIBUTES@@, \'$.model\'), \'\'),',
+      '           JSON_VALUE(@@ATTRIBUTES@@, \'$.model_version\')) AS model,',
+      '  COALESCE(NULLIF(JSON_VALUE(@@CONTENT@@, \'$.tool\'), \'\'),',
+      '           JSON_VALUE(@@CONTENT@@, \'$.tool_name\')) AS tool,',
+      '  SAFE_CAST(JSON_VALUE(@@LATENCY_MS@@, \'$.total_ms\') AS FLOAT64)',
+      '    AS total_ms,',
+      '  SAFE_CAST(JSON_VALUE(@@LATENCY_MS@@, \'$.time_to_first_token_ms\')',
+      '    AS FLOAT64) AS ttft_ms,',
       '  COALESCE(',
-      '    SAFE_CAST(JSON_VALUE(attributes,',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
       '      \'$.usage_metadata.prompt_token_count\') AS INT64),',
-      '    SAFE_CAST(JSON_VALUE(attributes,',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
       '      \'$.usage_metadata.prompt_tokens\') AS INT64),',
-      '    SAFE_CAST(JSON_VALUE(content, \'$.usage.prompt\') AS INT64))',
+      '    SAFE_CAST(JSON_VALUE(@@CONTENT@@, \'$.usage.prompt\') AS INT64))',
       '    AS prompt_tokens,',
-      '  SAFE_CAST(JSON_VALUE(attributes,',
-      '    \'$.usage_metadata.cached_content_token_count\') AS INT64) AS cached_tokens,',
-      '  SAFE_CAST(JSON_VALUE(attributes,',
+      '  COALESCE(',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
+      '      \'$.usage_metadata.cached_content_token_count\') AS INT64),',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
+      '      \'$.usage_metadata.cached_tokens\') AS INT64),',
+      '    SAFE_CAST(JSON_VALUE(@@CONTENT@@, \'$.usage.cached_tokens\') AS INT64),',
+      '    SAFE_CAST(JSON_VALUE(@@CONTENT@@,',
+      '      \'$.usage.prompt_tokens_details.cached_tokens\') AS INT64))',
+      '    AS cached_tokens,',
+      '  SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
       '    \'$.usage_metadata.thoughts_token_count\') AS INT64) AS thoughts_tokens,',
       '  COALESCE(',
-      '    SAFE_CAST(JSON_VALUE(attributes,',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
       '      \'$.usage_metadata.total_token_count\') AS INT64),',
-      '    SAFE_CAST(JSON_VALUE(attributes,',
+      '    SAFE_CAST(JSON_VALUE(@@ATTRIBUTES@@,',
       '      \'$.usage_metadata.total_tokens\') AS INT64),',
-      '    SAFE_CAST(JSON_VALUE(content, \'$.usage.total\') AS INT64))',
+      '    SAFE_CAST(JSON_VALUE(@@CONTENT@@, \'$.usage.total\') AS INT64))',
       '    AS total_tokens',
       `FROM \`${table}\``,
-      `WHERE timestamp >= TIMESTAMP(DATE_SUB(window_end, INTERVAL ${
-          2 * days - 1} DAY))`,
-      '  AND timestamp < TIMESTAMP(DATE_ADD(window_end, INTERVAL 1 DAY));',
+      `WHERE timestamp >= TIMESTAMP(DATE_SUB(@window_end, INTERVAL ${
+          2 * days - 1} DAY), 'UTC')`,
+      '  AND timestamp < TIMESTAMP(DATE_ADD(@window_end, INTERVAL 1 DAY), \'UTC\')',
+      '""",',
+      '  \'@@ATTRIBUTES@@\', IF(\'attributes\' IN UNNEST(present), \'attributes\',',
+      '    \'CAST(NULL AS STRING)\')),',
+      '  \'@@CONTENT@@\', IF(\'content\' IN UNNEST(present), \'content\',',
+      '    \'CAST(NULL AS STRING)\')),',
+      '  \'@@LATENCY_MS@@\', IF(\'latency_ms\' IN UNNEST(present), \'latency_ms\',',
+      '    \'CAST(NULL AS STRING)\'))',
+      'USING window_end AS window_end;',
       '',
       '-- KPIs for the window and the one before it',
       'SELECT',
@@ -1119,8 +1217,9 @@
       // when either of its series has one.
       const having = v.type === 'line' && v.secondaryMetric ?
           `HAVING ${v.metric} IS NOT NULL OR ${v.secondaryMetric} IS NOT NULL` :
-          `HAVING ${v.metric} IS NOT NULL`;
-      const limit = VISUAL_LIMITS[v.type];
+          v.type === 'donut' ? `HAVING ${v.metric} > 0` :
+                               `HAVING ${v.metric} IS NOT NULL`;
+      const limit = visualLimit(v);
       if (v.dim === 'event_date') {
         if (limit) {
           // Charts other than lines show the newest days, oldest first.
@@ -1321,9 +1420,11 @@
 
     container.querySelectorAll('circle[data-idx]').forEach((el) => {
       const d = series[Number(el.dataset.idx)];
-      el.addEventListener('mousemove',
-          (e) => showTooltip(e, tooltipHtml(d, vis.metric, vis.secondaryMetric)));
+      el.addEventListener('mousemove', (e) => showTooltip(e, tooltipHtml(
+          d, vis.metric, vis.secondaryMetric, vis.dim !== 'event_date')));
       el.addEventListener('mouseleave', hideTooltip);
+      // A point on a line over a category filters like a bar does.
+      el.addEventListener('click', () => toggleCrossFilter(vis.dim, d.label));
     });
   }
 
@@ -1331,8 +1432,9 @@
     elements.forEach((el) => {
       const d = items[Number(el.dataset.idx)];
       el.addEventListener('click', () => toggleCrossFilter(vis.dim, d.label));
-      el.addEventListener('mousemove',
-          (e) => showTooltip(e, tooltipHtml(d, vis.metric, null, true)));
+      // Days can't be cross-filtered, so only other members say they can.
+      el.addEventListener('mousemove', (e) => showTooltip(e,
+          tooltipHtml(d, vis.metric, null, vis.dim !== 'event_date')));
       el.addEventListener('mouseleave', hideTooltip);
     });
   }
@@ -1545,7 +1647,7 @@
     let list = rows.filter((r) => callTypes.has(r.event_type) &&
                                   (!vis.errorsOnly || isErrorRow(r)));
     if (vis.errorsOnly) {
-      list.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      list.sort((a, b) => tsKey(b) - tsKey(a));
     } else {
       list = list.filter((r) => isNum(r.total_ms));
       list.sort((a, b) => b.total_ms - a.total_ms);
@@ -1587,7 +1689,10 @@
     const series = aggregateBy(rows, vis.dim, vis.metric, vis.secondaryMetric,
         vis.type === 'line');
     if (vis.type === 'table') renderSeriesTable(container, series, vis);
-    else if (vis.type === 'line') renderLineChart(container, series, vis);
+    else if (vis.type === 'line') {
+      const limit = visualLimit(vis);
+      renderLineChart(container, limit ? series.slice(0, limit) : series, vis);
+    }
     else if (vis.type === 'donut') renderDonutChart(container, series, vis);
     else if (vis.type === 'hbar') renderHBarChart(container, series, vis);
     else renderBarChart(container, series, vis);
@@ -1661,7 +1766,7 @@
     document.getElementById('filterPills').innerHTML = filterKeys.map((k) =>
         `<span class="filter-pill"><span style="color:var(--muted-foreground);">` +
         `${escHtml(DIMENSIONS[k])}:</span><span style="font-weight:500;">${
-            escHtml(state.crossFilters[k])}</span>` +
+            escHtml(k === FAILED_FILTER ? 'only' : state.crossFilters[k])}</span>` +
         `<button type="button" data-rm-filter="${escAttr(k)}" aria-label="Remove ${
             escAttr(DIMENSIONS[k])} filter">×</button></span>`).join('');
     document.querySelectorAll('[data-rm-filter]').forEach((btn) => {
@@ -1933,6 +2038,21 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  // Microseconds past the millisecond in a TIMESTAMP value (0-999).
+  function timestampMicros(value, ms) {
+    const t = String(value).trim();
+    if (/^[+-]?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(t)) {
+      return Math.round((ms - Math.floor(ms)) * 1000) % 1000;
+    }
+    const frac = t.match(/:\d{2}\.(\d+)/);
+    return frac ? Number((frac[1] + '000000').slice(3, 6)) : 0;
+  }
+
+  // Sort key in microseconds; sample rows have no ts_us.
+  function tsKey(r) {
+    return r.ts_us ?? Date.parse(r.timestamp) * 1000;
+  }
+
   // Largest time a JavaScript Date can hold, in milliseconds.
   const MAX_DATE_MS = 8.64e15;
 
@@ -1968,7 +2088,12 @@
     if (ts === null || ts === undefined || ts === '') return null;
     const ms = parseTimestamp(ts);
     if (Number.isNaN(ms)) return null;
-    const iso = new Date(ms).toISOString();
+    // Date keeps milliseconds only; carry the microseconds separately so rows
+    // in the same millisecond keep their order and export unchanged.
+    const micros = timestampMicros(ts, ms);
+    const isoMs = new Date(Math.floor(ms)).toISOString();
+    const iso = micros ? isoMs.replace('Z', String(micros).padStart(3, '0') + 'Z') :
+                         isoMs;
     const latency = parseJsonColumn(r.latency_ms);
     const attributes = parseJsonColumn(r.attributes);
     const usage = attributes.usage_metadata || {};
@@ -1980,6 +2105,7 @@
     const text = (v) => (v === null || v === undefined ? '' : String(v));
     return {
       timestamp: iso,
+      ts_us: Math.floor(ms) * 1000 + micros,
       event_date: iso.slice(0, 10),
       event_type: text(r.event_type) || 'UNKNOWN',
       agent: text(r.agent),
@@ -1997,7 +2123,9 @@
       ttft_ms: toNumber(r.ttft_ms ?? latency.time_to_first_token_ms),
       prompt_tokens: toNumber(r.prompt_tokens ?? usage.prompt_token_count ??
           usage.prompt_tokens ?? contentUsage.prompt),
-      cached_tokens: toNumber(r.cached_tokens ?? usage.cached_content_token_count),
+      cached_tokens: toNumber(r.cached_tokens ?? usage.cached_content_token_count ??
+          usage.cached_tokens ?? contentUsage.cached_tokens ??
+          (contentUsage.prompt_tokens_details || {}).cached_tokens),
       candidates_tokens: toNumber(r.candidates_tokens ??
           usage.candidates_token_count ?? usage.completion_tokens ??
           contentUsage.completion),
@@ -2037,9 +2165,7 @@
       // column, so a CSV from elsewhere keeps its text even with the same
       // 21 data columns.
       const ownExport = header[header.length - 1] === GUARD_COLUMN;
-      const unguard = (c) =>
-          (ownExport && c.startsWith('\'') && needsFormulaGuard(c) ?
-               c.slice(1) : c);
+      const unguard = (c) => (ownExport ? unguardText(c) : c);
       records = table.map((cells) => Object.fromEntries(
           header.map((h, i) => [h, unguard(cells[i] ?? '')])));
     }
@@ -2054,7 +2180,7 @@
     if (!rows.length) {
       throw new Error('No row has a parseable timestamp column.');
     }
-    rows.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    rows.sort((a, b) => tsKey(b) - tsKey(a));
     return {rows, skipped: records.length - rows.length};
   }
 

@@ -327,14 +327,20 @@ check(/50\.0%/.test(els.kpiGrid.innerHTML),
         (els.kpiGrid.innerHTML.match(/[\d.]+%/) || [])[0]}`);
 check(created.some((e) => /bad/.test(e.innerHTML) && /Recent|Error/.test(e.innerHTML) ||
     /<td[^>]*>bad<\/td>/.test(e.innerHTML)), 'the errored call is in Recent errors');
-const clickable = created.flatMap((e) => e.matched || [])
-    .find((e) => e.dataset.idx !== undefined && (e.listeners.click || []).length);
-check(Boolean(clickable), 'chart members get click handlers');
-if (clickable) {
-  clickable.fire('click');
-  check(/filter-pill/.test(els.filterPills.innerHTML), 'clicking a chart member cross-filters');
-  els.btnClearFilters.fire('click');
+const clickables = created.flatMap((e) => e.matched || [])
+    .filter((e) => e.dataset.idx !== undefined && (e.listeners.click || []).length);
+check(clickables.length > 0, 'chart members get click handlers');
+// Per-day members can't be filtered, so try members until one filters.
+let filtered = false;
+for (const el of clickables) {
+  el.fire('click');
+  if (/filter-pill/.test(els.filterPills.innerHTML)) {
+    filtered = true;
+    break;
+  }
 }
+check(filtered, 'clicking a chart member cross-filters');
+els.btnClearFilters.fire('click');
 
 // Missing trace IDs and token fields stay missing, as in the SQL.
 els.importText.value = JSON.stringify([{timestamp: '2026-07-16T10:00:00Z',
@@ -458,8 +464,9 @@ els.btnShowSql.fire('click');
 const errSql = els.sqlModalCode.textContent;
 check(/event_type IN \('LLM_RESPONSE', 'TOOL_COMPLETED'\) AND status = 'ERROR'/.test(errSql),
     'the error-rate SQL counts error-status responses');
-check(/UPPER\(status\) AS status/.test(errSql), 'SQL upper-cases status once, like the page');
-check(/COALESCE\(NULLIF\(JSON_VALUE\(attributes, '\$\.model'\), ''\)/.test(errSql),
+check(/COALESCE\(NULLIF\(UPPER\(status\), ''\), 'OK'\) AS status/.test(errSql),
+    'SQL upper-cases status once and treats a missing one as OK, like the page');
+check(/COALESCE\(NULLIF\(JSON_VALUE\(@@ATTRIBUTES@@, '\$\.model'\), ''\)/.test(errSql),
     'an empty attributes.model falls back to model_version in SQL');
 check(/TIMESTAMP '0001-01-01'/.test(errSql), 'the fallback anchor covers pre-1970 timestamps');
 
@@ -502,6 +509,158 @@ els.btnApplyImport.fire('click');
 els.btnExportCsv.fire('click');
 check(csvRows(downloads[downloads.length - 1])[0].error_message === '\'\'--flag',
     'a same-column CSV from elsewhere keeps its leading apostrophe');
+
+// ===== Follow-ups from issue #611 =====
+
+// Returns the SQL statement for the KPI query, so checks don't match text
+// elsewhere in the script.
+const kpiSql = (sqlText) => (sqlText.split(';').find((st) => /AS period/.test(st)) || '');
+
+// 1. An agent literally named "agent" doesn't turn "by agent" into a filter.
+els.importText.value = JSON.stringify([
+  {timestamp: '2026-07-16T10:00:00Z', event_type: 'LLM_RESPONSE', agent: 'agent'},
+  {timestamp: '2026-07-16T10:01:00Z', event_type: 'LLM_RESPONSE', agent: 'other'},
+]);
+els.btnApplyImport.fire('click');
+els.promptInput.value = 'LLM calls by agent';
+els.promptForm.fire('submit');
+els.btnShowSql.fire('click');
+check(!/agent = 'agent'/.test(els.sqlModalCode.textContent),
+    '"by agent" does not filter to an agent named agent');
+els.promptInput.value = 'LLM calls for "agent"';
+els.promptForm.fire('submit');
+els.btnShowSql.fire('click');
+check(/agent = 'agent'/.test(els.sqlModalCode.textContent),
+    'a quoted member name still filters');
+els.btnResetPage.fire('click');
+
+// 2. "Failed calls only" keeps failed events that have no status.
+els.importText.value = JSON.stringify([
+  {timestamp: '2026-07-16T10:00:00Z', event_type: 'LLM_ERROR', agent: 'a'},
+  {timestamp: '2026-07-16T10:01:00Z', event_type: 'TOOL_ERROR', agent: 'a',
+    content: {tool: 't'}},
+  {timestamp: '2026-07-16T10:02:00Z', event_type: 'LLM_RESPONSE', agent: 'a',
+    status: 'OK'},
+]);
+els.btnApplyImport.fire('click');
+els.promptInput.value = 'Which tools fail most, failed calls only';
+els.promptForm.fire('submit');
+check(/100\.0%/.test(els.kpiGrid.innerHTML),
+    `failed calls only keeps status-less failures: ${
+        (els.kpiGrid.innerHTML.match(/[\d.]+%|--/) || [])[0]}`);
+els.btnShowSql.fire('click');
+check(/WHERE[\s\S]*event_type IN \('LLM_ERROR', 'TOOL_ERROR'\) OR/.test(
+    kpiSql(els.sqlModalCode.textContent)), 'failed calls only uses the failed-call rule in SQL');
+els.btnResetPage.fire('click');
+
+// 3. Cached tokens in content.usage count; absent stays distinct from zero.
+els.importText.value = JSON.stringify([
+  {timestamp: '2026-07-16T10:00:00Z', event_type: 'LLM_RESPONSE', agent: 'a',
+    content: {usage: {prompt: 100, cached_tokens: 80, total: 120}}},
+  {timestamp: '2026-07-16T10:01:00Z', event_type: 'LLM_RESPONSE', agent: 'a',
+    attributes: {usage_metadata: {prompt_token_count: 100,
+      cached_content_token_count: 0, total_token_count: 120}}},
+]);
+els.btnApplyImport.fire('click');
+els.promptInput.value = 'Token usage and cache hit rate by agent';
+els.promptForm.fire('submit');
+check(/>40\.0%</.test(els.kpiGrid.innerHTML), 'content.usage.cached_tokens counts (80 + 0 of 200 = 40%)');
+els.btnShowSql.fire('click');
+check(/\$\.usage\.cached_tokens/.test(els.sqlModalCode.textContent),
+    'SQL reads content.usage.cached_tokens');
+
+// 4 + 6. Missing payload columns and UTC day boundaries.
+const fuSql = els.sqlModalCode.textContent;
+check(/INFORMATION_SCHEMA\.COLUMNS/.test(fuSql) && /EXECUTE IMMEDIATE/.test(fuSql) &&
+    /IF\('attributes' IN UNNEST\(present\), 'attributes',/.test(fuSql),
+    'the temp table only reads payload columns that exist');
+check(!/\bDATE\(timestamp\)/.test(fuSql) && /DATE\(timestamp, 'UTC'\)/.test(fuSql) &&
+    /INTERVAL 1 DAY\), 'UTC'\)/.test(fuSql), 'SQL day boundaries are UTC');
+
+// 7. A line over a category is capped and its SQL has a LIMIT.
+els.importText.value = JSON.stringify(Array.from({length: 15}, (_, i) => ({
+  timestamp: `2026-07-16T10:${String(i).padStart(2, '0')}:00Z`,
+  event_type: 'LLM_RESPONSE', agent: 'a', session_id: `s${i}`, user_id: `u${i}`})));
+els.btnApplyImport.fire('click');
+els.promptInput.value = 'Sessions by user';
+els.promptForm.fire('submit');
+els.promptInput.value = 'switch to line';
+els.promptForm.fire('submit');
+const userLines = created.map((e) => e.innerHTML)
+    .filter((h) => /<polyline/.test(h) && />u\d+<\/text>/.test(h));
+check(userLines.length > 0 && userLines.every(
+    (h) => (h.match(/<circle[^>]*data-idx=/g) || []).length === 10),
+    'a categorical line plots its top 10 members');
+// A point on the user line cross-filters; per-day points don't offer to.
+const userDot = created.filter((e) => /<polyline/.test(e.innerHTML) &&
+    />u\d+<\/text>/.test(e.innerHTML)).flatMap((e) => e.matched || [])
+    .find((e) => (e.listeners.click || []).length);
+check(Boolean(userDot), 'categorical line points get a click handler');
+if (userDot) {
+  userDot.fire('click');
+  check(/filter-pill/.test(els.filterPills.innerHTML), 'clicking a categorical line point filters');
+  els.btnClearFilters.fire('click');
+}
+els.promptInput.value = 'switch to bar';
+els.promptForm.fire('submit');
+const dayBar = created.filter((e) => /class="chart-bar"/.test(e.innerHTML) &&
+    /2026-07-16/.test(e.innerHTML)).flatMap((e) => e.matched || [])
+    .find((e) => (e.listeners.mousemove || []).length);
+check(Boolean(dayBar), 'per-day bars render');
+if (dayBar) {
+  dayBar.fire('mousemove', {clientX: 0, clientY: 0});
+  check(!/Click to cross-filter/.test(els.chartTooltip.innerHTML),
+      'per-day bars do not claim to cross-filter');
+}
+els.promptInput.value = 'switch to line';
+els.promptForm.fire('submit');
+els.btnShowSql.fire('click');
+check(/GROUP BY user_id\nHAVING sessions IS NOT NULL\nORDER BY sessions DESC, user_id\nLIMIT 10;/
+    .test(els.sqlModalCode.textContent), 'a categorical line SQL has LIMIT 10');
+
+// 8. The formula guard covers a trigger after ";" or a tab, reversibly.
+els.importText.value = JSON.stringify(['x;=1+1;y', 'a\t@b', 'p;\'=q', 'plain;text']
+    .map((agent, i) => ({timestamp: `2026-07-16T10:00:0${i}Z`, event_type: 'LLM_RESPONSE', agent})));
+els.btnApplyImport.fire('click');
+els.btnExportCsv.fire('click');
+const midCsv = downloads[downloads.length - 1];
+check(midCsv.includes('x;\'=1+1;y') && midCsv.includes('a\t\'@b'),
+    'a formula trigger after ; or a tab is neutralized');
+els.importText.value = midCsv;
+els.btnApplyImport.fire('click');
+els.btnExportCsv.fire('click');
+check(downloads[downloads.length - 1] === midCsv, 'the mid-cell guard round-trips');
+
+// Smaller: microseconds keep the order of same-millisecond rows.
+els.importText.value = JSON.stringify([
+  {timestamp: '2026-07-16 10:00:00.123400 UTC', event_type: 'TOOL_ERROR', agent: 'first',
+    status: 'ERROR', error_message: 'first'},
+  {timestamp: '2026-07-16 10:00:00.123900 UTC', event_type: 'TOOL_ERROR', agent: 'second',
+    status: 'ERROR', error_message: 'second'},
+]);
+els.btnApplyImport.fire('click');
+els.btnExportCsv.fire('click');
+const usRows = csvRows(downloads[downloads.length - 1]);
+check(usRows[0].agent === 'second' && usRows[0].timestamp === '2026-07-16T10:00:00.123900Z',
+    `microseconds are kept for order and export: ${usRows.map((r) => r.timestamp).join(', ')}`);
+
+// Smaller: the error-rate check looks at the KPI query's own expression.
+els.promptInput.value = 'Which tools fail most, with recent error messages';
+els.promptForm.fire('submit');
+els.btnShowSql.fire('click');
+check(/100 \* SAFE_DIVIDE\(COUNTIF\(\(event_type IN \('LLM_ERROR', 'TOOL_ERROR'\) OR \(event_type IN \('LLM_RESPONSE', 'TOOL_COMPLETED'\) AND status = 'ERROR'\)\)\), COUNTIF\(event_type IN \('LLM_RESPONSE', 'LLM_ERROR', 'TOOL_COMPLETED', 'TOOL_ERROR'\)\)\) AS error_rate/
+    .test(kpiSql(els.sqlModalCode.textContent)), 'the KPI error-rate expression uses the failed-call rule');
+
+// Smaller: a row-capped import doesn't compare against a partial window.
+els.importText.value = JSON.stringify(Array.from({length: 12}, (_, i) => ({
+  timestamp: `2026-07-${String(5 + i).padStart(2, '0')}T10:00:00Z`,
+  event_type: 'LLM_RESPONSE', agent: 'a', session_id: `s${i}`})));
+els.btnApplyImport.fire('click');
+els.slicerDate.fire('change', {target: {value: '7'}});
+els.promptInput.value = 'Overview of sessions and users';
+els.promptForm.fire('submit');
+check(!/[+-]\d+(\.\d+)?%/.test(els.kpiGrid.innerHTML.replace(/class="kpi-value[\s\S]*?<\/div>/g, '')),
+    'deltas need a fully covered previous window');
 
 if (failures.length) {
   console.error(`FAILED:\n- ${failures.join('\n- ')}`);
