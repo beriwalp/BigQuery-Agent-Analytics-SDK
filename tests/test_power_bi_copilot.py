@@ -48,8 +48,30 @@ def test_no_vendor_names(name):
 @pytest.mark.parametrize("name", SOURCES)
 def test_loads_nothing_from_the_network(name):
   """Only the license header may contain a URL; nothing is fetched remotely."""
-  urls = re.findall(r"https?://[^\s\"'<>)]+", _read(name))
+  text = _read(name)
+  urls = re.findall(r"https?://[^\s\"'<>)]+", text)
   assert set(urls) <= {"https://www.apache.org/licenses/LICENSE-2.0"}, urls
+  # Scheme-relative references ("//host/path") load over the network too.
+  relative = re.findall(
+      r"""(?<=["'(=\s])//[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+""", text
+  )
+  assert not relative, relative
+
+
+def test_stylesheet_imports_nothing():
+  css = _read("styles.css").lower()
+  assert "@import" not in css
+  assert "url(" not in css
+
+
+def test_script_uses_no_network_apis():
+  script = _read("app.js")
+  apis = re.findall(
+      r"\b(fetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon"
+      r"|importScripts|import\s*\()",
+      script,
+  )
+  assert not apis, apis
 
 
 def test_page_uses_only_local_assets():
